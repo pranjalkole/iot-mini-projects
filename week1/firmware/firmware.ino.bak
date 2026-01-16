@@ -1,0 +1,168 @@
+#include "Zanshin_BME680.h"
+#include "config.h"
+#include "i2cutils.h"
+#include <Arduino.h>
+#include <LoRaWan_APP.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, OLED_RST, OLED_SCL, OLED_SDA);
+
+// ================= VARIABLES =================
+char txpacket[BUFFER_SIZE];
+char rxpacket[BUFFER_SIZE];
+
+#define VextON()                                                               \
+    pinMode(Vext, OUTPUT);                                                     \
+    digitalWrite(Vext, LOW)
+
+bool lora_idle = true;
+float localValue = 0.0;
+float remoteValue = 0.0;
+
+unsigned long lastSend = 0;
+const unsigned long sendInterval = 4000;
+
+BME680_Class BME680;
+
+static RadioEvents_t RadioEvents;
+
+// ================= CALLBACKS =================
+void OnTxDone(void) {
+    lora_idle = true;
+    Radio.Rx(0);
+}
+
+void OnTxTimeout(void) {
+    lora_idle = true;
+    Radio.Rx(0);
+}
+
+void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
+    memcpy(rxpacket, payload, size);
+    rxpacket[size] = '\0';
+
+    Serial.printf("Received: %s | RSSI: %d\n", rxpacket, rssi);
+
+    String data = String(rxpacket);
+    int idx = data.indexOf(':');
+    if (idx != -1) {
+        remoteValue = data.substring(idx + 1).toFloat();
+    }
+
+    lora_idle = true;
+    Radio.Rx(0);
+}
+
+static void init_oled_i2c(void) {
+    Wire.begin();
+    VextON();
+}
+
+// ================= SETUP =================
+void setup() {
+    Serial.begin(115200);
+    Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+    Wire.begin(OLED_SDA, OLED_SCL, 400000);
+
+    /* while (!BME680.begin(I2C_STANDARD_MODE)) { */
+    /*   Serial.print(F("- Unable to find BME680. Trying again in 5
+     * seconds.\n"));
+     */
+    /*   delay(5000); */
+    /* } */
+
+    /* listI2Cdevices(); // list all the devices on the first I2C port */
+
+    /* BME680.setOversampling(TemperatureSensor, Oversample16); */
+    /* BME680.setOversampling(PressureSensor, Oversample16); */
+    /* BME680.setOversampling(HumiditySensor, Oversample16); */
+    /* BME680.setIIRFilter(IIR4); */
+    /* BME680.setGas(320, 150); */
+
+    while (!wireBme.begin(BME_SDA, BME_SCL, 400000)) {
+        Serial.print(
+            F("- Unable to find any device on wireBme. Trying again in 5 "
+              "seconds.\n"));
+        delay(5000);
+    }
+
+    // OLED
+    VextON();
+    delay(100);
+    while (!wireOled.begin(OLED_SDA, OLED_SCL, 400000)) {
+        Serial.print(
+            F("- Unable to find any device on wireOled. Trying again in 5 "
+              "seconds.\n"));
+        delay(5000);
+    }
+
+    pinMode(OLED_RST, OUTPUT);
+    digitalWrite(OLED_RST, LOW);
+    delay(50);
+    digitalWrite(OLED_RST, HIGH);
+
+    listI2Cdevices(wireBme);
+    listI2Cdevices(wireOled); // list all the devices in the second I2C port
+
+    oled.begin();
+    oled.setFont(u8g2_font_ncenB08_tr);
+    oled.clearBuffer();
+    oled.drawStr(0, 15, "LoRa Two-Way");
+    oled.sendBuffer();
+
+    // LoRa
+    RadioEvents.TxDone = OnTxDone;
+    RadioEvents.TxTimeout = OnTxTimeout;
+    RadioEvents.RxDone = OnRxDone;
+
+    Radio.Init(&RadioEvents);
+    Radio.SetChannel(RF_FREQUENCY);
+
+    Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
+                      LORA_SPREADING_FACTOR, LORA_CODINGRATE,
+                      LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON, true, 0,
+                      0, LORA_IQ_INVERSION_ON, 3000);
+
+    Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
+                      LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
+                      LORA_FIX_LENGTH_PAYLOAD_ON, 0, true, 0, 0,
+                      LORA_IQ_INVERSION_ON, true, RX_TIMEOUT_VALUE);
+
+    Radio.Rx(0);
+}
+
+// ================= LOOP =================
+void loop() {
+
+    static int32_t temp, humidity, pressure, gas;
+
+    if (millis() - lastSend > sendInterval && lora_idle) {
+        lastSend = millis();
+
+        BME680.getSensorData(temp, humidity, pressure, gas);
+
+        sprintf(txpacket, "%3d.%02d %3d.%03d %7d.%02d %4d.%02d",
+                (int8_t)(temp / 100), (uint8_t)(temp % 100),
+                (int8_t)(humidity / 1000), (uint16_t)(humidity % 1000),
+                (int16_t)(pressure / 100), (uint8_t)(pressure % 100),
+                (int16_t)(gas / 100),
+                (uint8_t)(gas % 100)); // Humidity milli-pct
+
+        Serial.printf("Sending: %s\n", txpacket);
+        Radio.Send((uint8_t *)txpacket, strlen(txpacket));
+        lora_idle = false;
+    }
+
+    // OLED DISPLAY
+    oled.clearBuffer();
+    oled.drawStr(0, 12, "mClimate Node");
+    oled.drawStr(0, 30, ("Temp" + String(temp, 2)).c_str());
+    oled.drawStr(0, 50, ("Humidity: " + String(humidity, 2)).c_str());
+    oled.drawStr(0, 70, ("Pressure: " + String(pressure, 2)).c_str());
+    oled.drawStr(0, 50, ("Gas: " + String(gas, 2)).c_str());
+    oled.sendBuffer();
+
+    Radio.IrqProcess();
+    delay(100);
+}
