@@ -1,17 +1,22 @@
 #include "SensorInterface.h"
 #include "display.h"
 #include "lora_config.h"
+#include "packet.h"
 #include <Arduino.h>
 #include <LoRaWan_APP.h>
 
 #define BAUD 115200
+#define DEVICE_ID 0xA109
 
 static OledDisplay oledDisplay;
 static RadioEvents_t radioEvents;
 static SensorInterface sensorInterface;
+static LoRaPacket packet;
+static uint8_t txBuffer[PACKET_SIZE];
 
 static int16_t lastRssi = 0;
 static int8_t lastSNR = 0;
+static uint16_t packetSequence = 0;
 
 static void on_tx_done() { Radio.Rx(0); }
 static void on_tx_timeout() { Radio.Rx(0); }
@@ -65,6 +70,8 @@ void setup() {
   delay(2000);
   oledDisplay.clear();
   oledDisplay.commit();
+
+  initPacket(&packet, DEVICE_ID);
 }
 
 static uint8_t counter = 0;
@@ -114,6 +121,15 @@ void loop() {
 
   sensorInterface.getSensorData(temp, humidity, pressure, gas);
   renderDashboard(temp, humidity, pressure, gas);
+
+  populatePacket(&packet, packetSequence++, millis() / 1000, temp, humidity,
+                 pressure, gas);
+
+  uint8_t len = encodePacket(packet, txBuffer);
+  Radio.Send(txBuffer, len);
+
+  // Debug output
+  printPacket(packet);
 
   Radio.IrqProcess();
   delay(1000);
